@@ -1,0 +1,6 @@
+.env
+conjectures.db
+.venv/
+.venv-sandbox/
+__pycache__/
+*.pyc
