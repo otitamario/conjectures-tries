@@ -23,7 +23,7 @@ from schemas import (
 )
 from llm_calls import (
     run_prompt_1, run_prompt_2, run_prompt_3, run_prompt_6,
-    run_prompt_3_with_repair, print_stats,  # novos imports
+    run_prompt_3_with_repair, print_stats, get_stats,  # ← adicione get_stats
 )
 
 from sandbox_executor import run_candidate_code
