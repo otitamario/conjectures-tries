@@ -16,6 +16,7 @@ CORREÇÕES APLICADAS:
 - Redução do max_chars no Prompt 0 para 15000
 - Heurística agressiva de reparo de JSON truncado
 - Logging detalhado de finish_reason
+- NORMALIZAÇÃO DE CAMPOS: likely_proof_mechanism (lista→string), checkability (texto→enum)
 """
 
 import env  # noqa: F401  (carrega .env antes de qualquer os.environ.get abaixo)
@@ -291,7 +292,7 @@ reduces_to_symbolic_identity, ambiguities_to_resolve, code, correspondence_table
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# FUNÇÕES DE PARSE ROBUSTO
+# FUNÇÕES DE PARSE ROBUSTO + NORMALIZAÇÃO DE CAMPOS
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _fix_truncated_json(text: str) -> str:
@@ -379,6 +380,113 @@ def _fix_truncated_json(text: str) -> str:
     return result
 
 
+def _normalize_field(data: dict, field_name: str, target_type: str = "string") -> None:
+    """Normaliza um campo para o tipo esperado pelo schema."""
+    if field_name not in data:
+        return
+
+    value = data[field_name]
+
+    if target_type == "string" and isinstance(value, list):
+        # Converte lista para string concatenada
+        data[field_name] = " | ".join(str(v) for v in value)
+        print(f"  [NORMALIZAÇÃO] {field_name}: lista → string")
+
+    elif target_type == "list" and isinstance(value, str):
+        # Converte string para lista com um elemento
+        data[field_name] = [value]
+        print(f"  [NORMALIZAÇÃO] {field_name}: string → lista")
+
+
+def _normalize_checkability(data: dict) -> None:
+    """Normaliza o campo checkability para um dos valores do enum válidos."""
+    if "checkability" not in data:
+        return
+
+    raw = str(data["checkability"]).strip().upper()
+
+    # Mapeamento de sinônimos/comportamentos para valores do enum
+    mappings = {
+        "SYMBOLIC": ["SYMBOLIC", "SYMBOLICALLY", "ALGEBRAIC", "CLOSED FORM", "ANALYTIC"],
+        "BOUNDED_COMPUTATIONAL": [
+            "BOUNDED", "COMPUTATIONAL", "COMPUTABLE", "BRUTE FORCE", 
+            "FINITE", "ENUMERATIVE", "EXHAUSTIVE", "ALGORITHMIC"
+        ],
+        "NOT_READILY_CHECKABLE": [
+            "NOT READILY", "NOT_CHECKABLE", "UNCHECKABLE", "DIFFICULT",
+            "HARD", "COMPLEX", "NON-COMPUTABLE", "THEORETICAL"
+        ],
+    }
+
+    for canonical, synonyms in mappings.items():
+        if any(syn in raw for syn in synonyms):
+            if data["checkability"] != canonical:
+                print(f"  [NORMALIZAÇÃO] checkability: '{data['checkability']}' → '{canonical}'")
+                data["checkability"] = canonical
+            return
+
+    # Se não conseguiu mapear, força para BOUNDED_COMPUTATIONAL como default seguro
+    print(f"  [NORMALIZAÇÃO] checkability: '{data['checkability']}' não mapeado → 'BOUNDED_COMPUTATIONAL' (default)")
+    data["checkability"] = "BOUNDED_COMPUTATIONAL"
+
+
+def _normalize_status(data: dict) -> None:
+    """Normaliza o campo status para um dos valores do enum válidos."""
+    if "status" not in data:
+        return
+
+    raw = str(data["status"]).strip().upper()
+
+    mappings = {
+        "PLAUSIBLY_TRUE": ["PLAUSIBLY_TRUE", "TRUE", "LIKELY", "PROBABLE", "PLAUSIBLE"],
+        "PLAUSIBLY_FALSE": ["PLAUSIBLY_FALSE", "FALSE", "UNLIKELY", "IMPROBABLE"],
+        "UNCERTAIN": ["UNCERTAIN", "UNKNOWN", "OPEN", "UNSURE", "NEUTRAL"],
+    }
+
+    for canonical, synonyms in mappings.items():
+        if any(syn in raw for syn in synonyms):
+            if data["status"] != canonical:
+                print(f"  [NORMALIZAÇÃO] status: '{data['status']}' → '{canonical}'")
+                data["status"] = canonical
+            return
+
+    # Default seguro
+    print(f"  [NORMALIZAÇÃO] status: '{data['status']}' não mapeado → 'UNCERTAIN' (default)")
+    data["status"] = "UNCERTAIN"
+
+
+def _normalize_result_analysis(data: dict) -> None:
+    """Aplica todas as normalizações necessárias para ResultAnalysis."""
+    _normalize_field(data, "likely_proof_mechanism", "string")
+    _normalize_field(data, "restatement", "string")
+    _normalize_field(data, "conclusion", "string")
+    _normalize_field(data, "formalized_statement", "string")
+    _normalize_checkability(data)
+
+    # Garante que campos de lista sejam listas
+    for list_field in ["subareas", "quantified_objects", "explicit_hypotheses", 
+                       "implicit_assumptions", "ambiguities"]:
+        _normalize_field(data, list_field, "list")
+
+
+def _normalize_conjecture(data: dict) -> None:
+    """Aplica normalizações para Conjecture."""
+    _normalize_checkability(data)
+    _normalize_status(data)
+
+
+def _normalize_all(data: dict, schema_name: str) -> None:
+    """Aplica normalizações específicas baseadas no schema."""
+    if schema_name == "ResultAnalysis":
+        _normalize_result_analysis(data)
+    elif schema_name == "ConjectureBatch":
+        if "candidates" in data and isinstance(data["candidates"], list):
+            for c in data["candidates"]:
+                _normalize_conjecture(c)
+    elif schema_name == "Conjecture":
+        _normalize_conjecture(data)
+
+
 def _parse(raw: str, schema):
     """
     Parseia JSON com tratamento de:
@@ -386,6 +494,7 @@ def _parse(raw: str, schema):
     - Markdown code blocks (```json ... ```)
     - Respostas vazias ou não-JSON
     - Listas embrulhadas em objeto
+    - NORMALIZAÇÃO DE CAMPOS para compatibilidade com schema Pydantic
     """
     if not raw or not raw.strip():
         raise ValueError("Resposta da API está vazia (raw='' ou whitespace-only)")
@@ -403,6 +512,7 @@ def _parse(raw: str, schema):
     # Tenta parsear o JSON
     data = None
     last_error = None
+    used_repair = False
 
     # Tentativa 1: JSON direto
     try:
@@ -435,6 +545,7 @@ def _parse(raw: str, schema):
         try:
             fixed = _fix_truncated_json(cleaned)
             data = json.loads(fixed)
+            used_repair = True
             print(f"  [REPARO] JSON truncado consertado com heurística.")
         except Exception as e3:
             raise ValueError(
@@ -458,6 +569,20 @@ def _parse(raw: str, schema):
                 "candidates": data,
                 "top_three": [c.get("name", "") for c in data[:3]]
             }
+
+    # ── NORMALIZAÇÃO DE CAMPOS para compatibilidade com schema ──
+    if isinstance(data, dict):
+        _normalize_all(data, schema.__name__)
+
+        # Normaliza também campos aninhados (ex: candidates dentro de ConjectureBatch)
+        if "candidates" in data and isinstance(data["candidates"], list):
+            for c in data["candidates"]:
+                if isinstance(c, dict):
+                    _normalize_all(c, "Conjecture")
+        if "results" in data and isinstance(data["results"], list):
+            for r in data["results"]:
+                if isinstance(r, dict):
+                    _normalize_all(r, "ExtractedResult")
 
     return schema.model_validate(data)
 
@@ -510,10 +635,17 @@ def run_prompt_1(theorem_statement: str, context: str = "") -> ResultAnalysis:
 Contexto opcional:
 {context}
 
-Analise o resultado antes de tentar formalizá-lo, retornando os campos do schema ResultAnalysis
-(restatement, subareas, quantified_objects, explicit_hypotheses, implicit_assumptions,
-conclusion, likely_proof_mechanism, checkability, needs_networkx, ambiguities,
-formalized_statement, in_scope)."""
+Analise o resultado antes de tentar formalizá-lo, retornando os campos do schema ResultAnalysis.
+
+IMPORTANTE: Siga EXATAMENTE estes tipos:
+- likely_proof_mechanism: UMA string (ex: "Induction on n"), NÃO uma lista
+- checkability: EXATAMENTE uma destas strings: "SYMBOLIC", "BOUNDED_COMPUTATIONAL", ou "NOT_READILY_CHECKABLE"
+- subareas, quantified_objects, explicit_hypotheses, implicit_assumptions, ambiguities: listas de strings
+- restatement, conclusion, formalized_statement: strings
+- needs_networkx: true ou false
+- in_scope: true ou false
+
+Retorne um objeto JSON com TODOS estes campos."""
 
     raw = call_model(SYSTEM_MATH_RESEARCH, user + JSON_ONLY_SUFFIX, model=MODEL_ANALYSIS)
     return _parse(raw, ResultAnalysis)
@@ -526,8 +658,15 @@ def run_prompt_2(analysis: ResultAnalysis) -> ConjectureBatch:
 
 Gere no máximo dez conjecturas candidatas (campo `candidates`), cada uma com name,
 changed_component, statement, motivation, status, status_reason,
-counterexample_direction, checkability, needs_networkx. Ao final, preencha
-`top_three` com os nomes dos três candidatos mais promissores, em ordem."""
+counterexample_direction, checkability, needs_networkx.
+
+IMPORTANTE: Siga EXATAMENTE estes tipos:
+- status: EXATAMENTE uma destas strings: "PLAUSIBLY_TRUE", "PLAUSIBLY_FALSE", ou "UNCERTAIN"
+- checkability: EXATAMENTE uma destas strings: "SYMBOLIC", "BOUNDED_COMPUTATIONAL", ou "NOT_READILY_CHECKABLE"
+- needs_networkx: true ou false
+- counterexample_direction: string ou null
+
+Ao final, preencha `top_three` com os nomes dos três candidatos mais promissores, em ordem."""
 
     raw = call_model(SYSTEM_MATH_RESEARCH, user + JSON_ONLY_SUFFIX, model=MODEL_CONJECTURES)
     return _parse(raw, ConjectureBatch)
