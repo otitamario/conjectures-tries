@@ -8,13 +8,22 @@ Uma função por prompt do workflow. Cada função:
 
 Adaptado para API Kimi (Moonshot AI) - compatível com OpenAI SDK.
 Otimizado para context caching e escalonamento automático de modelos.
+
+CORREÇÕES APLICADAS:
+- Tratamento de JSON truncado (max_tokens atingido no meio da string)
+- Tratamento de respostas vazias (prompt muito grande)
+- Aumento de max_tokens para 32768
+- Redução do max_chars no Prompt 0 para 15000
+- Heurística agressiva de reparo de JSON truncado
+- Logging detalhado de finish_reason
 """
 
 import env  # noqa: F401  (carrega .env antes de qualquer os.environ.get abaixo)
 import json
 import os
+import re
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Callable
 from openai import OpenAI
 from schemas import (
@@ -69,7 +78,8 @@ _client = OpenAI(
 )
 
 # Parâmetros padrão de geração
-DEFAULT_MAX_TOKENS = 16384 # Aumentado de 4096
+# AUMENTADO: de 8192 para 32768 para evitar truncamento de JSONs grandes
+DEFAULT_MAX_TOKENS = 32768
 DEFAULT_TEMPERATURE = 1.0
 
 
@@ -97,7 +107,7 @@ SYSTEM_PROVER = (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ESTATÍSTICAS DE USO (CORRIGIDO - sem field conflitante)
+# ESTATÍSTICAS DE USO
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -109,7 +119,7 @@ class ModelUsageStats:
     output_tokens: int = 0
     successes: int = 0
     failures: int = 0
-    
+
     @property
     def estimated_cost(self) -> float:
         """Custo estimado em USD (sem cache)."""
@@ -122,7 +132,7 @@ class ModelUsageStats:
                 self.output_tokens / 1_000_000 * price["output"])
 
 
-# Estatísticas globais (inicialização simples, sem field)
+# Estatísticas globais
 _stats: dict[str, ModelUsageStats] = {
     "kimi-k2-5": ModelUsageStats(model_name="kimi-k2-5"),
     "kimi-k2-6": ModelUsageStats(model_name="kimi-k2-6"),
@@ -188,32 +198,32 @@ def call_model(
             messages=messages,
             response_format={"type": "json_object"},  # Força objeto JSON, não lista
         )
-        
+
         result = response.choices[0].message.content
-        
+
         # Detecta se a resposta foi truncada (finish_reason)
         finish_reason = response.choices[0].finish_reason
         if finish_reason == "length":
             print(f"  [AVISO] Resposta TRUNCADA por max_tokens! "
                   f"JSON pode estar incompleto. ({len(result)} chars)")
-        
+
         if track_stats and model in _stats:
             stat = _stats[model]
             stat.calls += 1
             stat.input_tokens += estimated_input_tokens
             stat.output_tokens += len(result) // 3
             stat.successes += 1
-        
+
         elapsed = time.time() - start_time
         print(f"  [API] {model} | {elapsed:.1f}s | input ~{estimated_input_tokens} tokens | "
               f"output ~{len(result)//3} tokens | finish={finish_reason}")
-        
+
         return result
-        
+
     except Exception as e:
         if track_stats and model in _stats:
             _stats[model].failures += 1
-        
+
         elapsed = time.time() - start_time
         print(f"  [API] {model} | FALHA após {elapsed:.1f}s | {type(e).__name__}: {e}")
         raise
@@ -234,7 +244,7 @@ def run_prompt_3_with_repair(
     Gera plano de verificação com escalonamento automático de modelo em repairs.
     """
     is_repair = repair_attempt > 0
-    
+
     if not is_repair:
         model = MODEL_VERIFICATION
         user = f"""Formalize esta afirmação como algo checável com Sympy (e networkx se envolver grafos):
@@ -247,10 +257,10 @@ Definições informais usadas:
 Preencha o schema VerificationPlan: objects_and_representation, sympy_networkxFunctions,
 reduces_to_symbolic_identity, ambiguities_to_resolve, code (código Python completo e
 executável, com print/assert de PASS/FAIL), correspondence_table, verification_risks."""
-    
+
     else:
         remaining = max_repairs - repair_attempt + 1
-        
+
         if remaining <= 1 and repair_attempt >= REPAIR_ESCALATION_THRESHOLD:
             model = MODEL_REPAIR_ESCALATION
             print(f"  [REPAIR] Escalonando para {model} (tentativa {repair_attempt}, "
@@ -259,7 +269,7 @@ executável, com print/assert de PASS/FAIL), correspondence_table, verification_
             model = MODEL_REPAIR_PRIMARY
             print(f"  [REPAIR] Usando {model} (tentativa {repair_attempt}, "
                   f"escala em {REPAIR_ESCALATION_THRESHOLD})")
-        
+
         user = f"""A seguinte conjectura precisa ser verificada em Sympy/networkx:
 
 {selected_statement}
@@ -275,14 +285,99 @@ Gere um novo código Python completo e executável.]
 
 Preencha o schema VerificationPlan: objects_and_representation, sympy_networkxFunctions,
 reduces_to_symbolic_identity, ambiguities_to_resolve, code, correspondence_table, verification_risks."""
-    
+
     raw = call_model(SYSTEM_MATH_RESEARCH, user + JSON_ONLY_SUFFIX, model=model)
     return _parse(raw, VerificationPlan)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# PROMPTS DO WORKFLOW
+# FUNÇÕES DE PARSE ROBUSTO
 # ─────────────────────────────────────────────────────────────────────────────
+
+def _fix_truncated_json(text: str) -> str:
+    """
+    Heurística agressiva para tentar consertar JSONs truncados pelo max_tokens.
+    Completa strings não fechadas, arrays/objetos não fechados, etc.
+    """
+    result = text.strip()
+    if not result:
+        return "{}"
+
+    # Se já termina com } ou ], pode ser válido
+    if result.rstrip().endswith(("}", "]")):
+        try:
+            json.loads(result)
+            return result
+        except json.JSONDecodeError:
+            pass  # continua tentando consertar
+
+    # Completa strings não terminadas
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(result):
+        if escaped:
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+
+    if in_string:
+        result += '"'
+
+    # Remove trailing vírgulas, dois-pontos soltos, etc.
+    result = result.rstrip()
+    while result and result[-1] in ",:":
+        result = result[:-1].rstrip()
+
+    # Fecha estruturas abertas usando stack (ordem LIFO)
+    stack = []
+    in_str = False
+    esc = False
+    for ch in result:
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch in "{[":
+            stack.append(ch)
+        elif ch == "}" and stack and stack[-1] == "{":
+            stack.pop()
+        elif ch == "]" and stack and stack[-1] == "[":
+            stack.pop()
+
+    # Fecha no sentido inverso
+    for opener in reversed(stack):
+        if opener == "{":
+            result += "}"
+        else:
+            result += "]"
+
+    # Se ainda não é um objeto JSON válido, tenta extrair objeto interno
+    try:
+        json.loads(result)
+    except json.JSONDecodeError:
+        start = result.find("{")
+        end = result.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            try:
+                inner = result[start:end+1]
+                json.loads(inner)
+                result = inner
+            except json.JSONDecodeError:
+                pass
+
+    return result
+
 
 def _parse(raw: str, schema):
     """
@@ -294,41 +389,38 @@ def _parse(raw: str, schema):
     """
     if not raw or not raw.strip():
         raise ValueError("Resposta da API está vazia (raw='' ou whitespace-only)")
-    
+
     # Remove markdown code blocks
     cleaned = raw.strip()
     if cleaned.startswith("```"):
-        # Pega tudo entre ```json e ``` ou entre ``` e ```
         lines = cleaned.split("\n")
         if lines[0].startswith("```"):
             lines = lines[1:]
         if lines and lines[-1].strip() == "```":
             lines = lines[:-1]
         cleaned = "\n".join(lines).strip()
-    
+
     # Tenta parsear o JSON
     data = None
     last_error = None
-    
+
     # Tentativa 1: JSON direto
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError as e1:
         last_error = e1
-        
-        # Tentativa 2: Tenta encontrar o JSON mais completo possível dentro do texto
-        # Procura por { ... } mais profundo possível
+
+        # Tentativa 2: Extrai objeto JSON mais completo possível
         try:
-            start = cleaned.find('{')
-            end = cleaned.rfind('}')
+            start = cleaned.find("{")
+            end = cleaned.rfind("}")
             if start != -1 and end != -1 and end > start:
                 data = json.loads(cleaned[start:end+1])
         except json.JSONDecodeError as e2:
             last_error = e2
-            
-            # Tentativa 3: Tenta truncar no último ponto válido (heurística para JSON cortado)
+
+            # Tentativa 3: Tenta truncar no último ponto válido
             try:
-                # Encontra a última posição onde o JSON ainda é válido
                 for i in range(len(cleaned), 0, -1):
                     try:
                         data = json.loads(cleaned[:i])
@@ -337,26 +429,27 @@ def _parse(raw: str, schema):
                         continue
             except Exception:
                 pass
-    
+
     if data is None:
-        # Tenta uma última heurística: completar strings não terminadas
+        # Último recurso: heurística de reparo de JSON truncado
         try:
             fixed = _fix_truncated_json(cleaned)
             data = json.loads(fixed)
+            print(f"  [REPARO] JSON truncado consertado com heurística.")
         except Exception as e3:
             raise ValueError(
                 f"Não foi possível parsear JSON da resposta da API. "
                 f"Erro original: {last_error}. "
                 f"Primeiros 500 chars da resposta: {cleaned[:500]!r}"
             ) from last_error
-    
+
     # ── Normalização de formatos alternativos ──
     if isinstance(data, dict):
         if "theorems" in data and "results" not in data:
             data["results"] = data.pop("theorems")
         if "candidates" in data and "top_three" not in data:
             data["top_three"] = [c.get("name", "") for c in data["candidates"][:3]]
-    
+
     elif isinstance(data, list):
         if schema.__name__ == 'ExtractedResultsBatch':
             data = {"results": data}
@@ -365,54 +458,19 @@ def _parse(raw: str, schema):
                 "candidates": data,
                 "top_three": [c.get("name", "") for c in data[:3]]
             }
-    
+
     return schema.model_validate(data)
 
 
-def _fix_truncated_json(text: str) -> str:
-    """
-    Heurística para tentar consertar JSONs truncados pelo max_tokens.
-    Completa strings não fechadas, arrays/objetos não fechados, etc.
-    """
-    result = text.strip()
-    
-    # Completa strings não terminadas
-    # Conta aspas não escapadas
-    in_string = False
-    escaped = False
-    for i, ch in enumerate(result):
-        if escaped:
-            escaped = False
-            continue
-        if ch == '\\':
-            escaped = True
-            continue
-        if ch == '"':
-            in_string = not in_string
-    
-    if in_string:
-        result += '"'
-    
-    # Fecha arrays/objetos abertos (ordem importa!)
-    # Remove trailing vírgulas antes de fechar
-    result = result.rstrip().rstrip(',').rstrip()
-    
-    open_braces = result.count('{') - result.count('}')
-    open_brackets = result.count('[') - result.count(']')
-    
-    # Fecha no sentido inverso (LIFO)
-    for _ in range(open_brackets):
-        result += ']'
-    for _ in range(open_braces):
-        result += '}'
-    
-    return result
-
-    
+# ─────────────────────────────────────────────────────────────────────────────
+# PROMPTS DO WORKFLOW
+# ─────────────────────────────────────────────────────────────────────────────
 
 def run_prompt_0(paper_text: str, max_chars: int = 15_000) -> ExtractedResultsBatch:
-    # Antes era 150_000, agora 40_000 chars (~13.300 tokens estimados)
-    # Deixa mais margem pro modelo responder
+    """
+    Extrai teoremas do paper. REDUZIDO para 15.000 chars para evitar
+    que o prompt ocupe todo o contexto e deixe 0 tokens para a resposta.
+    """
     truncated = paper_text[:max_chars]
     user = f"""Aqui está o texto (possivelmente truncado) de um paper:
 
@@ -420,7 +478,7 @@ def run_prompt_0(paper_text: str, max_chars: int = 15_000) -> ExtractedResultsBa
 {truncated}
 ---
 
-Extraia TODOS os teoremas, lemas ou proposições que:
+Extraia os PRINCIPAIS teoremas, lemas ou proposições (máximo 15) que:
 1. são efetivamente PROVADOS neste paper (não citados de outro trabalho, não
    deixados como conjectura em aberto pelos próprios autores);
 2. pertencem a combinatória e/ou teoria dos números elementar/enumerativa
@@ -439,7 +497,7 @@ combinatório/aritmético próprio. Priorize os resultados principais do paper.
 
 IMPORTANTE: Retorne um objeto JSON com a chave EXATA "results" (não "theorems"), assim:
 {{"results": [{{"label": "Theorem 1.1", "statement": "...", "context": "...", "in_scope": true, "is_proved_in_paper": true}}]}}"""
-    
+
     raw = call_model(SYSTEM_EXTRACTOR, user + JSON_ONLY_SUFFIX, model=MODEL_EXTRACTION)
     return _parse(raw, ExtractedResultsBatch)
 
@@ -456,7 +514,7 @@ Analise o resultado antes de tentar formalizá-lo, retornando os campos do schem
 (restatement, subareas, quantified_objects, explicit_hypotheses, implicit_assumptions,
 conclusion, likely_proof_mechanism, checkability, needs_networkx, ambiguities,
 formalized_statement, in_scope)."""
-    
+
     raw = call_model(SYSTEM_MATH_RESEARCH, user + JSON_ONLY_SUFFIX, model=MODEL_ANALYSIS)
     return _parse(raw, ResultAnalysis)
 
@@ -470,7 +528,7 @@ Gere no máximo dez conjecturas candidatas (campo `candidates`), cada uma com na
 changed_component, statement, motivation, status, status_reason,
 counterexample_direction, checkability, needs_networkx. Ao final, preencha
 `top_three` com os nomes dos três candidatos mais promissores, em ordem."""
-    
+
     raw = call_model(SYSTEM_MATH_RESEARCH, user + JSON_ONLY_SUFFIX, model=MODEL_CONJECTURES)
     return _parse(raw, ConjectureBatch)
 
@@ -487,7 +545,7 @@ Definições informais usadas:
 Preencha o schema VerificationPlan: objects_and_representation, sympy_networkxFunctions,
 reduces_to_symbolic_identity, ambiguities_to_resolve, code (código Python completo e
 executável, com print/assert de PASS/FAIL), correspondence_table, verification_risks."""
-    
+
     raw = call_model(SYSTEM_MATH_RESEARCH, user + JSON_ONLY_SUFFIX, model=actual_model)
     return _parse(raw, VerificationPlan)
 
@@ -504,6 +562,6 @@ Tente avançar de evidência computacional para uma prova real. NÃO declare "pr
 base apenas em checagem finita. Preencha o schema ProofAttempt: reduced_to_symbolic_identity,
 proof_status ("proved" | "bounded_evidence_only" | "neither"), informal_proof, final_code,
 techniques_used, unresolved_step."""
-    
+
     raw = call_model(SYSTEM_MATH_RESEARCH, user + JSON_ONLY_SUFFIX, model=MODEL_PROOF)
     return _parse(raw, ProofAttempt)
