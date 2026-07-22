@@ -16,7 +16,7 @@ from config import (
     MAX_RESULTS_PER_SEARCH, ARXIV_RATE_LIMIT_SECONDS,
 )
 
-ARXIV_API_URL = "http://export.arxiv.org/api/query"
+ARXIV_API_URL = "https://export.arxiv.org/api/query"
 
 # MSC codes têm o formato "05C05", "11B39" etc. -- procura isso em
 # qualquer lugar do comentário ou abstract.

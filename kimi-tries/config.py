@@ -24,7 +24,7 @@ TARGET_MSC_PREFIXES = [
 ]
 
 DATE_TO = "2024-12-31"
-DATE_FROM = None  # None = sem limite inferior
+DATE_FROM = "2000-01-01"  # None = sem limite inferior
 
 MAX_RESULTS_PER_SEARCH = 100
 ARXIV_RATE_LIMIT_SECONDS = 3  # arXiv pede pelo menos 3s entre requisições

@@ -22,8 +22,9 @@ from schemas import (
 )
 
 JSON_ONLY_SUFFIX = (
-    "\n\nResponda SOMENTE com um objeto JSON válido, sem texto antes ou depois, "
-    "sem blocos de código markdown (sem ```)."
+    "\n\nResponda SOMENTE com um objeto JSON válido (não uma lista), "
+    "sem texto antes ou depois, sem blocos de código markdown (sem ```). "
+    "O JSON deve ser um objeto com as chaves especificadas no schema."
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -31,26 +32,46 @@ JSON_ONLY_SUFFIX = (
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Modelos por tarefa (configurável via variáveis de ambiente)
-MODEL_EXTRACTION = os.environ.get("PIPELINE_MODEL_P0", "kimi-k2-5")        # Prompt 0: extração
-MODEL_ANALYSIS = os.environ.get("PIPELINE_MODEL_P1", "kimi-k2-6")           # Prompt 1: análise
-MODEL_CONJECTURES = os.environ.get("PIPELINE_MODEL_P2", "kimi-k2-6")      # Prompt 2: conjecturas
-MODEL_VERIFICATION = os.environ.get("PIPELINE_MODEL_P3", "kimi-k2-6")      # Prompt 3: verificação
-MODEL_REPAIR_PRIMARY = os.environ.get("PIPELINE_MODEL_REPAIR", "kimi-k2-5")  # Repair: 1ª tentativa
-MODEL_REPAIR_ESCALATION = os.environ.get("PIPELINE_MODEL_REPAIR_LAST", "kimi-k2-6")  # Repair: última
-MODEL_PROOF = os.environ.get("PIPELINE_MODEL_P6", "kimi-k2-6")            # Prompt 6: prova
+# Base URL correta (sua chave só funciona na .ai, não na .cn)
+KIMI_BASE_URL = os.environ.get("KIMI_BASE_URL", "https://api.moonshot.ai/v1")
+
+
+# Modelos disponíveis na SUA conta (pelo teste)
+MODEL_EXTRACTION = os.environ.get("PIPELINE_MODEL_P0", "kimi-k2.6")      # Prompt 0
+MODEL_ANALYSIS = os.environ.get("PIPELINE_MODEL_P1", "kimi-k2.6")         # Prompt 1
+MODEL_CONJECTURES = os.environ.get("PIPELINE_MODEL_P2", "kimi-k2.6")      # Prompt 2
+MODEL_VERIFICATION = os.environ.get("PIPELINE_MODEL_P3", "kimi-k2.6")     # Prompt 3
+MODEL_REPAIR_PRIMARY = os.environ.get("PIPELINE_MODEL_REPAIR", "kimi-k2.6")  # Repair
+MODEL_REPAIR_ESCALATION = os.environ.get("PIPELINE_MODEL_REPAIR_LAST", "kimi-k2.6")  # Repair last
+MODEL_PROOF = os.environ.get("PIPELINE_MODEL_P6", "kimi-k2.6")            # Prompt 6
+
+
 
 # Limite de tentativas com K2.5 antes de escalar para K2.6
 REPAIR_ESCALATION_THRESHOLD = int(os.environ.get("REPAIR_ESCALATION_THRESHOLD", "2"))
 
+# Verificação explícita da API Key
+_kimi_api_key = os.environ.get("KIMI_API_KEY")
+if not _kimi_api_key:
+    raise RuntimeError(
+        "KIMI_API_KEY não encontrada! Verifique:\n"
+        "  1. Arquivo .env existe na raiz do projeto?\n"
+        "  2. Contém a linha: KIMI_API_KEY=sk-xxxxxxxx?\n"
+        "  3. python-dotenv está instalado? (pip install python-dotenv)\n"
+        "  4. A variável não está comentada (# no início)?"
+    )
+
 # Cliente Kimi (API compatível com OpenAI)
+# Cliente Kimi (base URL corrigida)
 _client = OpenAI(
-    api_key=os.environ.get("KIMI_API_KEY"),
-    base_url="https://api.moonshot.cn/v1",
+    api_key=_kimi_api_key,
+    base_url=KIMI_BASE_URL,
 )
 
 # Parâmetros padrão de geração
-DEFAULT_MAX_TOKENS = 4096
-DEFAULT_TEMPERATURE = 0.2
+DEFAULT_MAX_TOKENS = 16384 # Aumentado de 4096
+DEFAULT_TEMPERATURE = 1.0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SYSTEM PROMPTS OTIMIZADOS PARA CONTEXT CACHING
@@ -76,12 +97,13 @@ SYSTEM_PROVER = (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# ESTATÍSTICAS DE USO (para otimização contínua)
+# ESTATÍSTICAS DE USO (CORRIGIDO - sem field conflitante)
 # ─────────────────────────────────────────────────────────────────────────────
 
 @dataclass
 class ModelUsageStats:
     """Estatísticas de uso por modelo para análise de custo-efetividade."""
+    model_name: str = ""
     calls: int = 0
     input_tokens: int = 0
     output_tokens: int = 0
@@ -91,7 +113,6 @@ class ModelUsageStats:
     @property
     def estimated_cost(self) -> float:
         """Custo estimado em USD (sem cache)."""
-        # Preços por 1M tokens
         prices = {
             "kimi-k2-5": {"input": 0.60, "output": 3.00},
             "kimi-k2-6": {"input": 0.95, "output": 4.00},
@@ -99,21 +120,13 @@ class ModelUsageStats:
         price = prices.get(self.model_name, {"input": 0.95, "output": 4.00})
         return (self.input_tokens / 1_000_000 * price["input"] + 
                 self.output_tokens / 1_000_000 * price["output"])
-    
-    def __post_init__(self):
-        self.model_name = ""  # será setado externamente
 
 
-# Estatísticas globais (persistidas em memória durante a execução)
+# Estatísticas globais (inicialização simples, sem field)
 _stats: dict[str, ModelUsageStats] = {
-    "kimi-k2-5": field(default_factory=lambda: _create_stat("kimi-k2-5")),
-    "kimi-k2-6": field(default_factory=lambda: _create_stat("kimi-k2-6")),
+    "kimi-k2-5": ModelUsageStats(model_name="kimi-k2-5"),
+    "kimi-k2-6": ModelUsageStats(model_name="kimi-k2-6"),
 }
-
-def _create_stat(name: str) -> ModelUsageStats:
-    stat = ModelUsageStats()
-    stat.model_name = name
-    return stat
 
 
 def get_stats() -> dict[str, ModelUsageStats]:
@@ -158,25 +171,12 @@ def call_model(
 ) -> str:
     """
     Chama a API Kimi com formato compatível OpenAI.
-    
-    Args:
-        system_prompt: Instruções de sistema
-        user_prompt: Prompt do usuário
-        model: Nome do modelo (kimi-k2-5 ou kimi-k2-6)
-        max_tokens: Máximo de tokens de saída
-        temperature: Temperatura de amostragem
-        track_stats: Se True, registra estatísticas de uso
-    
-    Returns:
-        Texto da resposta do modelo
     """
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
 
-    # Estimativa de tokens de input (aproximada: 1 token ≈ 4 chars em inglês, 2 em chinês,
-    # mas para português/técnico usamos fator conservador)
     estimated_input_tokens = len(system_prompt + user_prompt) // 3
 
     start_time = time.time()
@@ -186,26 +186,31 @@ def call_model(
             max_tokens=max_tokens,
             temperature=temperature,
             messages=messages,
+            response_format={"type": "json_object"},  # Força objeto JSON, não lista
         )
         
         result = response.choices[0].message.content
         
-        # Atualiza estatísticas
+        # Detecta se a resposta foi truncada (finish_reason)
+        finish_reason = response.choices[0].finish_reason
+        if finish_reason == "length":
+            print(f"  [AVISO] Resposta TRUNCADA por max_tokens! "
+                  f"JSON pode estar incompleto. ({len(result)} chars)")
+        
         if track_stats and model in _stats:
             stat = _stats[model]
             stat.calls += 1
             stat.input_tokens += estimated_input_tokens
-            # Estimativa conservadora: output é metade do max_tokens em média
             stat.output_tokens += len(result) // 3
             stat.successes += 1
         
         elapsed = time.time() - start_time
-        print(f"  [API] {model} | {elapsed:.1f}s | input ~{estimated_input_tokens} tokens")
+        print(f"  [API] {model} | {elapsed:.1f}s | input ~{estimated_input_tokens} tokens | "
+              f"output ~{len(result)//3} tokens | finish={finish_reason}")
         
         return result
         
     except Exception as e:
-        # Registra falha
         if track_stats and model in _stats:
             _stats[model].failures += 1
         
@@ -227,15 +232,10 @@ def run_prompt_3_with_repair(
 ) -> VerificationPlan:
     """
     Gera plano de verificação com escalonamento automático de modelo em repairs.
-    
-    Estratégia:
-      - Tentativa 0 (original): K2.6
-      - Repairs 1-N: K2.5 nas primeiras tentativas, K2.6 na última
     """
     is_repair = repair_attempt > 0
     
     if not is_repair:
-        # Primeira tentativa: sempre K2.6 para máxima qualidade
         model = MODEL_VERIFICATION
         user = f"""Formalize esta afirmação como algo checável com Sympy (e networkx se envolver grafos):
 
@@ -249,16 +249,13 @@ reduces_to_symbolic_identity, ambiguities_to_resolve, code (código Python compl
 executável, com print/assert de PASS/FAIL), correspondence_table, verification_risks."""
     
     else:
-        # Repair: decide modelo baseado na tentativa
         remaining = max_repairs - repair_attempt + 1
         
         if remaining <= 1 and repair_attempt >= REPAIR_ESCALATION_THRESHOLD:
-            # Última tentativa ou já falhou várias vezes com K2.5: escala para K2.6
             model = MODEL_REPAIR_ESCALATION
             print(f"  [REPAIR] Escalonando para {model} (tentativa {repair_attempt}, "
                   f"threshold={REPAIR_ESCALATION_THRESHOLD})")
         else:
-            # Ainda tem tentativas sobrando: usa K2.5 para economizar
             model = MODEL_REPAIR_PRIMARY
             print(f"  [REPAIR] Usando {model} (tentativa {repair_attempt}, "
                   f"escala em {REPAIR_ESCALATION_THRESHOLD})")
@@ -288,15 +285,134 @@ reduces_to_symbolic_identity, ambiguities_to_resolve, code, correspondence_table
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _parse(raw: str, schema):
-    cleaned = raw.strip().removeprefix("```json").removesuffix("```").strip()
-    return schema.model_validate(json.loads(cleaned))
+    """
+    Parseia JSON com tratamento de:
+    - JSON truncado (max_tokens atingido no meio da string)
+    - Markdown code blocks (```json ... ```)
+    - Respostas vazias ou não-JSON
+    - Listas embrulhadas em objeto
+    """
+    if not raw or not raw.strip():
+        raise ValueError("Resposta da API está vazia (raw='' ou whitespace-only)")
+    
+    # Remove markdown code blocks
+    cleaned = raw.strip()
+    if cleaned.startswith("```"):
+        # Pega tudo entre ```json e ``` ou entre ``` e ```
+        lines = cleaned.split("\n")
+        if lines[0].startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip() == "```":
+            lines = lines[:-1]
+        cleaned = "\n".join(lines).strip()
+    
+    # Tenta parsear o JSON
+    data = None
+    last_error = None
+    
+    # Tentativa 1: JSON direto
+    try:
+        data = json.loads(cleaned)
+    except json.JSONDecodeError as e1:
+        last_error = e1
+        
+        # Tentativa 2: Tenta encontrar o JSON mais completo possível dentro do texto
+        # Procura por { ... } mais profundo possível
+        try:
+            start = cleaned.find('{')
+            end = cleaned.rfind('}')
+            if start != -1 and end != -1 and end > start:
+                data = json.loads(cleaned[start:end+1])
+        except json.JSONDecodeError as e2:
+            last_error = e2
+            
+            # Tentativa 3: Tenta truncar no último ponto válido (heurística para JSON cortado)
+            try:
+                # Encontra a última posição onde o JSON ainda é válido
+                for i in range(len(cleaned), 0, -1):
+                    try:
+                        data = json.loads(cleaned[:i])
+                        break
+                    except json.JSONDecodeError:
+                        continue
+            except Exception:
+                pass
+    
+    if data is None:
+        # Tenta uma última heurística: completar strings não terminadas
+        try:
+            fixed = _fix_truncated_json(cleaned)
+            data = json.loads(fixed)
+        except Exception as e3:
+            raise ValueError(
+                f"Não foi possível parsear JSON da resposta da API. "
+                f"Erro original: {last_error}. "
+                f"Primeiros 500 chars da resposta: {cleaned[:500]!r}"
+            ) from last_error
+    
+    # ── Normalização de formatos alternativos ──
+    if isinstance(data, dict):
+        if "theorems" in data and "results" not in data:
+            data["results"] = data.pop("theorems")
+        if "candidates" in data and "top_three" not in data:
+            data["top_three"] = [c.get("name", "") for c in data["candidates"][:3]]
+    
+    elif isinstance(data, list):
+        if schema.__name__ == 'ExtractedResultsBatch':
+            data = {"results": data}
+        elif schema.__name__ == 'ConjectureBatch':
+            data = {
+                "candidates": data,
+                "top_three": [c.get("name", "") for c in data[:3]]
+            }
+    
+    return schema.model_validate(data)
 
 
-def run_prompt_0(paper_text: str, max_chars: int = 150_000) -> ExtractedResultsBatch:
+def _fix_truncated_json(text: str) -> str:
     """
-    Prompt 0: Extração de teoremas do paper.
-    Modelo: K2.5 (tarefa simples, economia de 37% vs K2.6)
+    Heurística para tentar consertar JSONs truncados pelo max_tokens.
+    Completa strings não fechadas, arrays/objetos não fechados, etc.
     """
+    result = text.strip()
+    
+    # Completa strings não terminadas
+    # Conta aspas não escapadas
+    in_string = False
+    escaped = False
+    for i, ch in enumerate(result):
+        if escaped:
+            escaped = False
+            continue
+        if ch == '\\':
+            escaped = True
+            continue
+        if ch == '"':
+            in_string = not in_string
+    
+    if in_string:
+        result += '"'
+    
+    # Fecha arrays/objetos abertos (ordem importa!)
+    # Remove trailing vírgulas antes de fechar
+    result = result.rstrip().rstrip(',').rstrip()
+    
+    open_braces = result.count('{') - result.count('}')
+    open_brackets = result.count('[') - result.count(']')
+    
+    # Fecha no sentido inverso (LIFO)
+    for _ in range(open_brackets):
+        result += ']'
+    for _ in range(open_braces):
+        result += '}'
+    
+    return result
+
+    
+
+def run_prompt_0(paper_text: str, max_chars: int = 15_000) -> ExtractedResultsBatch:
+    # Antes era 150_000, agora 40_000 chars (~13.300 tokens estimados)
+    # Deixa mais margem pro modelo responder
     truncated = paper_text[:max_chars]
     user = f"""Aqui está o texto (possivelmente truncado) de um paper:
 
@@ -319,17 +435,16 @@ entender o statement sem olhar o resto do paper), in_scope,
 is_proved_in_paper.
 
 Não inclua lemas técnicos triviais de manipulação algébrica sem interesse
-combinatório/aritmético próprio. Priorize os resultados principais do paper."""
+combinatório/aritmético próprio. Priorize os resultados principais do paper.
+
+IMPORTANTE: Retorne um objeto JSON com a chave EXATA "results" (não "theorems"), assim:
+{{"results": [{{"label": "Theorem 1.1", "statement": "...", "context": "...", "in_scope": true, "is_proved_in_paper": true}}]}}"""
     
     raw = call_model(SYSTEM_EXTRACTOR, user + JSON_ONLY_SUFFIX, model=MODEL_EXTRACTION)
     return _parse(raw, ExtractedResultsBatch)
 
 
 def run_prompt_1(theorem_statement: str, context: str = "") -> ResultAnalysis:
-    """
-    Prompt 1: Análise do resultado.
-    Modelo: K2.6 (requer raciocínio matemático profundo)
-    """
     user = f"""Aqui está o resultado:
 
 {theorem_statement}
@@ -347,10 +462,6 @@ formalized_statement, in_scope)."""
 
 
 def run_prompt_2(analysis: ResultAnalysis) -> ConjectureBatch:
-    """
-    Prompt 2: Geração de conjecturas.
-    Modelo: K2.6 (criatividade + rigor matemático)
-    """
     user = f"""A partir desta análise:
 
 {analysis.model_dump_json(indent=2)}
@@ -365,12 +476,6 @@ counterexample_direction, checkability, needs_networkx. Ao final, preencha
 
 
 def run_prompt_3(selected_statement: str, definitions: str = "", model: str = None) -> VerificationPlan:
-    """
-    Prompt 3: Plano de verificação (primeira tentativa).
-    Modelo: K2.6 (geração de código complexo)
-    
-    Nota: Para repairs, use run_prompt_3_with_repair() no orquestrador.
-    """
     actual_model = model or MODEL_VERIFICATION
     user = f"""Formalize esta afirmação como algo checável com Sympy (e networkx se envolver grafos):
 
@@ -388,10 +493,6 @@ executável, com print/assert de PASS/FAIL), correspondence_table, verification_
 
 
 def run_prompt_6(working_code: str, mathematical_statement: str) -> ProofAttempt:
-    """
-    Prompt 6: Tentativa de prova genuína.
-    Modelo: K2.6 (maior capacidade de reasoning)
-    """
     user = f"""O seguinte código tem uma verificação Sympy/networkx funcionando:
 
 {working_code}
