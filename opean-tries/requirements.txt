@@ -8,3 +8,4 @@ feedparser>=6.0
 pypdf>=4.0
 datasette
 datasette-pretty-json
+tiktoken

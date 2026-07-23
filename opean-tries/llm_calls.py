@@ -32,6 +32,11 @@ from openai import (
     OpenAI,
     RateLimitError,
 )
+
+class EmptyModelResponseError(RuntimeError):
+    """A API respondeu, mas sem conteúdo útil."""
+    pass
+
 from schemas import (
     ExtractedResultsBatch, ResultAnalysis, ConjectureBatch, VerificationPlan, ProofAttempt,
 )
@@ -88,6 +93,21 @@ MODEL_REPAIR_ESCALATION = os.environ.get(
 
 MODEL_PROOF = os.environ.get(
     "PIPELINE_MODEL_P6",
+    "gpt-5.1",
+)
+
+MODEL_EXTRACTION_FALLBACK = os.environ.get(
+    "PIPELINE_MODEL_P0_FALLBACK",
+    "gpt-5-mini",
+)
+
+MODEL_ANALYSIS_FALLBACK = os.environ.get(
+    "PIPELINE_MODEL_P1_FALLBACK",
+    "gpt-5-mini",
+)
+
+MODEL_VERIFICATION_FALLBACK = os.environ.get(
+    "PIPELINE_MODEL_P3_FALLBACK",
     "gpt-5.1",
 )
 
@@ -184,6 +204,9 @@ _stats: dict[str, ModelUsageStats] = {
         MODEL_REPAIR_PRIMARY,
         MODEL_REPAIR_ESCALATION,
         MODEL_PROOF,
+        MODEL_EXTRACTION_FALLBACK,
+        MODEL_ANALYSIS_FALLBACK,
+        MODEL_VERIFICATION_FALLBACK,
     }
 }
 
@@ -227,27 +250,40 @@ def call_model(
     max_tokens: int = DEFAULT_MAX_TOKENS,
     track_stats: bool = True,
     stage: str = "indefinida",
+    fallback_model: str | None = None,
 ) -> str:
     """
-    Chama a Chat Completions API com timeout por requisição e retries explícitos.
+    Chama a Chat Completions API com timeout, logging e retries explícitos.
 
-    Faz retry apenas em falhas transitórias:
-    - timeout;
-    - conexão;
-    - rate limit;
-    - erro interno do servidor.
+    Política:
+    - resposta vazia com fallback configurado: escala imediatamente;
+    - timeout, conexão, rate limit e erro interno: retry no mesmo modelo;
+    - resposta vazia sem fallback: retry normal até o limite.
     """
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-    estimated_input_tokens = len(system_prompt + user_prompt) // 3
+
+    system_chars = len(system_prompt)
+    user_chars = len(user_prompt)
+    total_chars = system_chars + user_chars
+    estimated_input_tokens = max(1, total_chars // 3)
 
     retryable_errors = (
         APITimeoutError,
         APIConnectionError,
         RateLimitError,
         InternalServerError,
+        EmptyModelResponseError,
+    )
+
+    print(
+        f"  [PROMPT] etapa={stage} | "
+        f"system={system_chars:,} chars | "
+        f"user={user_chars:,} chars | "
+        f"total={total_chars:,} chars | "
+        f"tokens_estimados≈{estimated_input_tokens:,}"
     )
 
     for attempt in range(1, API_MAX_RETRIES + 1):
@@ -269,7 +305,7 @@ def call_model(
 
             result = response.choices[0].message.content
             if not result or not result.strip():
-                raise ValueError(
+                raise EmptyModelResponseError(
                     f"Resposta vazia na etapa {stage}, usando o modelo {model}."
                 )
 
@@ -289,27 +325,39 @@ def call_model(
                 stat.successes += 1
 
             elapsed = time.time() - start_time
-            actual_input = (
-                response.usage.prompt_tokens
-                if response.usage
-                else estimated_input_tokens
-            )
-            actual_output = (
-                response.usage.completion_tokens
-                if response.usage
-                else len(result) // 3
-            )
+            actual_input = response.usage.prompt_tokens if response.usage else estimated_input_tokens
+            actual_output = response.usage.completion_tokens if response.usage else len(result) // 3
+
             print(
                 f"  [API] etapa={stage} | modelo={model} | OK em {elapsed:.1f}s | "
-                f"input={actual_input} | output={actual_output} | "
-                f"finish={finish_reason}"
+                f"input={actual_input} | output={actual_output} | finish={finish_reason}"
             )
             return result
 
         except retryable_errors as exc:
             elapsed = time.time() - start_time
+
             if track_stats and model in _stats:
                 _stats[model].failures += 1
+
+            if (
+                isinstance(exc, EmptyModelResponseError)
+                and fallback_model
+                and fallback_model != model
+            ):
+                print(
+                    f"  [API] etapa={stage} | modelo={model} retornou vazio "
+                    f"após {elapsed:.1f}s. Escalando imediatamente para {fallback_model}."
+                )
+                return call_model(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    model=fallback_model,
+                    max_tokens=max_tokens,
+                    track_stats=track_stats,
+                    stage=f"{stage}_fallback",
+                    fallback_model=None,
+                )
 
             if attempt >= API_MAX_RETRIES:
                 print(
@@ -326,8 +374,7 @@ def call_model(
             delay += random.uniform(0, min(2.0, delay * 0.2))
             print(
                 f"  [API] etapa={stage} | erro transitório após {elapsed:.1f}s: "
-                f"{type(exc).__name__}: {exc}. "
-                f"Nova tentativa em {delay:.1f}s."
+                f"{type(exc).__name__}: {exc}. Nova tentativa em {delay:.1f}s."
             )
             time.sleep(delay)
 
@@ -406,14 +453,17 @@ reduces_to_symbolic_identity, ambiguities_to_resolve, code, correspondence_table
         MAX_TOKENS_REPAIR
         if is_repair
         else MAX_TOKENS_VERIFICATION
-    )    
+    )
 
     raw = call_model(
-    SYSTEM_MATH_RESEARCH,
-    user + JSON_ONLY_SUFFIX,
-    model=model,
-    max_tokens=token_limit,
+        SYSTEM_VERIFICATION,
+        user + JSON_ONLY_SUFFIX,
+        model=model,
+        max_tokens=token_limit,
         stage="prompt_3_repair" if is_repair else "prompt_3_verification",
+        fallback_model=(
+            None if is_repair else MODEL_VERIFICATION_FALLBACK
+        ),
     )
     return _parse(raw, VerificationPlan)
 
@@ -751,11 +801,12 @@ IMPORTANTE: Retorne um objeto JSON com a chave EXATA "results" (não "theorems")
 {{"results": [{{"label": "Theorem 1.1", "statement": "...", "context": "...", "in_scope": true, "is_proved_in_paper": true}}]}}"""
 
     raw = call_model(
-    SYSTEM_EXTRACTOR,
-    user + JSON_ONLY_SUFFIX,
-    model=MODEL_EXTRACTION,
-    max_tokens=MAX_TOKENS_EXTRACTION,
+        SYSTEM_EXTRACTOR,
+        user + JSON_ONLY_SUFFIX,
+        model=MODEL_EXTRACTION,
+        max_tokens=MAX_TOKENS_EXTRACTION,
         stage="prompt_0_extraction",
+        fallback_model=MODEL_EXTRACTION_FALLBACK,
     )
     return _parse(raw, ExtractedResultsBatch)
 
@@ -781,11 +832,12 @@ IMPORTANTE: Siga EXATAMENTE estes tipos:
 Retorne um objeto JSON com TODOS estes campos."""
 
     raw = call_model(
-    SYSTEM_MATH_RESEARCH,
-    user + JSON_ONLY_SUFFIX,
-    model=MODEL_ANALYSIS,
-    max_tokens=MAX_TOKENS_ANALYSIS,
+        SYSTEM_MATH_RESEARCH,
+        user + JSON_ONLY_SUFFIX,
+        model=MODEL_ANALYSIS,
+        max_tokens=MAX_TOKENS_ANALYSIS,
         stage="prompt_1_analysis",
+        fallback_model=MODEL_ANALYSIS_FALLBACK,
     )
     return _parse(raw, ResultAnalysis)
 
@@ -808,10 +860,10 @@ IMPORTANTE: Siga EXATAMENTE estes tipos:
 Ao final, preencha `top_three` com os nomes dos três candidatos mais promissores, em ordem."""
 
     raw = call_model(
-    SYSTEM_MATH_RESEARCH,
-    user + JSON_ONLY_SUFFIX,
-    model=MODEL_CONJECTURES,
-    max_tokens=MAX_TOKENS_CONJECTURES,
+        SYSTEM_MATH_RESEARCH,
+        user + JSON_ONLY_SUFFIX,
+        model=MODEL_CONJECTURES,
+        max_tokens=MAX_TOKENS_CONJECTURES,
         stage="prompt_2_conjectures",
     )
     return _parse(raw, ConjectureBatch)
@@ -831,11 +883,16 @@ reduces_to_symbolic_identity, ambiguities_to_resolve, code (código Python compl
 executável, com print/assert de PASS/FAIL), correspondence_table, verification_risks."""
 
     raw = call_model(
-    SYSTEM_MATH_RESEARCH,
-    user + JSON_ONLY_SUFFIX,
-    model=actual_model,
-    max_tokens=MAX_TOKENS_VERIFICATION,
+        SYSTEM_VERIFICATION,
+        user + JSON_ONLY_SUFFIX,
+        model=actual_model,
+        max_tokens=MAX_TOKENS_VERIFICATION,
         stage="prompt_3_verification",
+        fallback_model=(
+            MODEL_VERIFICATION_FALLBACK
+            if actual_model != MODEL_VERIFICATION_FALLBACK
+            else None
+        ),
     )
     return _parse(raw, VerificationPlan)
 
@@ -862,10 +919,10 @@ proof_status ("proved" | "bounded_evidence_only" | "neither"), informal_proof, f
 techniques_used, unresolved_step."""
 
     raw = call_model(
-    SYSTEM_PROVER,
-    user + JSON_ONLY_SUFFIX,
-    model=MODEL_PROOF,
-    max_tokens=MAX_TOKENS_PROOF,
+        SYSTEM_PROVER,
+        user + JSON_ONLY_SUFFIX,
+        model=MODEL_PROOF,
+        max_tokens=MAX_TOKENS_PROOF,
         stage="prompt_6_proof",
     )
     return _parse(raw, ProofAttempt)
