@@ -2,11 +2,11 @@
 Uma função por prompt do workflow. Cada função:
   1. monta o prompt (mesmo texto do documento original),
   2. injeta um bloco de instrução de saída (forçar JSON puro),
-  3. chama a API,
+  3. Chama a API da OpenAI.
   4. valida com o schema pydantic correspondente,
   5. levanta exceção clara se a validação falhar (para o orquestrador decidir re-tentar).
 
-Adaptado para API Kimi (Moonshot AI) - compatível com OpenAI SDK.
+
 Otimizado para context caching e escalonamento automático de modelos.
 
 CORREÇÕES APLICADAS:
@@ -22,11 +22,16 @@ CORREÇÕES APLICADAS:
 import env  # noqa: F401  (carrega .env antes de qualquer os.environ.get abaixo)
 import json
 import os
-import re
+import random
 import time
 from dataclasses import dataclass
-from typing import Callable
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
 from schemas import (
     ExtractedResultsBatch, ResultAnalysis, ConjectureBatch, VerificationPlan, ProofAttempt,
 )
@@ -38,51 +43,80 @@ JSON_ONLY_SUFFIX = (
 )
 
 # ─────────────────────────────────────────────────────────────────────────────
-# CONFIGURAÇÃO KIMI - ESTRATÉGIA HÍBRIDA COM ESCALONAMENTO
+# CONFIGURAÇÃO OPENAI - ESTRATÉGIA HÍBRIDA COM ESCALONAMENTO
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Modelos por tarefa (configurável via variáveis de ambiente)
-# Base URL correta (sua chave só funciona na .ai, não na .cn)
-KIMI_BASE_URL = os.environ.get("KIMI_BASE_URL", "https://api.moonshot.ai/v1")
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY")
+
+if not OPENAI_API_KEY:
+    raise RuntimeError(
+        "OPENAI_API_KEY não encontrada no arquivo .env"
+    )
 
 
 # Modelos disponíveis na SUA conta (pelo teste)
-MODEL_EXTRACTION = os.environ.get("PIPELINE_MODEL_P0", "kimi-k2.6")      # Prompt 0
-MODEL_ANALYSIS = os.environ.get("PIPELINE_MODEL_P1", "kimi-k2.6")         # Prompt 1
-MODEL_CONJECTURES = os.environ.get("PIPELINE_MODEL_P2", "kimi-k2.6")      # Prompt 2
-MODEL_VERIFICATION = os.environ.get("PIPELINE_MODEL_P3", "kimi-k2.6")     # Prompt 3
-MODEL_REPAIR_PRIMARY = os.environ.get("PIPELINE_MODEL_REPAIR", "kimi-k2.6")  # Repair
-MODEL_REPAIR_ESCALATION = os.environ.get("PIPELINE_MODEL_REPAIR_LAST", "kimi-k2.6")  # Repair last
-MODEL_PROOF = os.environ.get("PIPELINE_MODEL_P6", "kimi-k2.6")            # Prompt 6
-
-
-
-# Limite de tentativas com K2.5 antes de escalar para K2.6
-REPAIR_ESCALATION_THRESHOLD = int(os.environ.get("REPAIR_ESCALATION_THRESHOLD", "2"))
-
-# Verificação explícita da API Key
-_kimi_api_key = os.environ.get("KIMI_API_KEY")
-if not _kimi_api_key:
-    raise RuntimeError(
-        "KIMI_API_KEY não encontrada! Verifique:\n"
-        "  1. Arquivo .env existe na raiz do projeto?\n"
-        "  2. Contém a linha: KIMI_API_KEY=sk-xxxxxxxx?\n"
-        "  3. python-dotenv está instalado? (pip install python-dotenv)\n"
-        "  4. A variável não está comentada (# no início)?"
-    )
-
-# Cliente Kimi (API compatível com OpenAI)
-# Cliente Kimi (base URL corrigida)
-_client = OpenAI(
-    api_key=_kimi_api_key,
-    base_url=KIMI_BASE_URL,
-    timeout=300.0,  # 5 minutos
+MODEL_EXTRACTION = os.environ.get(
+    "PIPELINE_MODEL_P0",
+    "gpt-5-nano",
 )
 
+MODEL_ANALYSIS = os.environ.get(
+    "PIPELINE_MODEL_P1",
+    "gpt-5-mini",
+)
+
+MODEL_CONJECTURES = os.environ.get(
+    "PIPELINE_MODEL_P2",
+    "gpt-5-mini",
+)
+
+MODEL_VERIFICATION = os.environ.get(
+    "PIPELINE_MODEL_P3",
+    "gpt-5-mini",
+)
+
+MODEL_REPAIR_PRIMARY = os.environ.get(
+    "PIPELINE_MODEL_REPAIR",
+    "gpt-5-nano",
+)
+
+MODEL_REPAIR_ESCALATION = os.environ.get(
+    "PIPELINE_MODEL_REPAIR_LAST",
+    "gpt-5-mini",
+)
+
+MODEL_PROOF = os.environ.get(
+    "PIPELINE_MODEL_P6",
+    "gpt-5.1",
+)
+
+# Número de repairs antes de escalar para o modelo mais forte
+REPAIR_ESCALATION_THRESHOLD = int(os.environ.get("REPAIR_ESCALATION_THRESHOLD", "2"))
+
+# Cliente sem retries internos: os retries são controlados abaixo, com logging claro.
+_client = OpenAI(
+    api_key=OPENAI_API_KEY,
+    timeout=float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "300")),
+    max_retries=0,
+)
+
+# Parâmetros de resiliência
+API_TIMEOUT_SECONDS = float(os.environ.get("OPENAI_TIMEOUT_SECONDS", "300"))
+API_MAX_RETRIES = int(os.environ.get("OPENAI_MAX_RETRIES", "3"))
+API_RETRY_BASE_SECONDS = float(os.environ.get("OPENAI_RETRY_BASE_SECONDS", "5"))
+API_RETRY_MAX_SECONDS = float(os.environ.get("OPENAI_RETRY_MAX_SECONDS", "60"))
+
 # Parâmetros padrão de geração
-# AUMENTADO: de 8192 para 32768 para evitar truncamento de JSONs grandes
-DEFAULT_MAX_TOKENS = 32768
-DEFAULT_TEMPERATURE = 1.0
+DEFAULT_MAX_TOKENS = 8_000
+
+# Limites por etapa
+MAX_TOKENS_EXTRACTION = int(os.environ.get("MAX_TOKENS_EXTRACTION", "8000"))
+MAX_TOKENS_ANALYSIS = int(os.environ.get("MAX_TOKENS_ANALYSIS", "6000"))
+MAX_TOKENS_CONJECTURES = int(os.environ.get("MAX_TOKENS_CONJECTURES", "10000"))
+MAX_TOKENS_VERIFICATION = int(os.environ.get("MAX_TOKENS_VERIFICATION", "6000"))
+MAX_TOKENS_REPAIR = int(os.environ.get("MAX_TOKENS_REPAIR", "4000"))
+MAX_TOKENS_PROOF = int(os.environ.get("MAX_TOKENS_PROOF", "12000"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -126,18 +160,31 @@ class ModelUsageStats:
     def estimated_cost(self) -> float:
         """Custo estimado em USD (sem cache)."""
         prices = {
-            "kimi-k2-5": {"input": 0.60, "output": 3.00},
-            "kimi-k2-6": {"input": 0.95, "output": 4.00},
+            # Atualize estes valores quando os preços oficiais mudarem.
+            "gpt-5-nano": {"input": 0.05, "output": 0.40},
+            "gpt-5-mini": {"input": 0.25, "output": 2.00},
+            "gpt-5.1": {"input": 1.25, "output": 10.00},
         }
-        price = prices.get(self.model_name, {"input": 0.95, "output": 4.00})
+        price = prices.get(self.model_name)
+
+        if price is None:
+            return 0.0
         return (self.input_tokens / 1_000_000 * price["input"] + 
                 self.output_tokens / 1_000_000 * price["output"])
 
 
 # Estatísticas globais
 _stats: dict[str, ModelUsageStats] = {
-    "kimi-k2-5": ModelUsageStats(model_name="kimi-k2-5"),
-    "kimi-k2-6": ModelUsageStats(model_name="kimi-k2-6"),
+    model: ModelUsageStats(model_name=model)
+    for model in {
+        MODEL_EXTRACTION,
+        MODEL_ANALYSIS,
+        MODEL_CONJECTURES,
+        MODEL_VERIFICATION,
+        MODEL_REPAIR_PRIMARY,
+        MODEL_REPAIR_ESCALATION,
+        MODEL_PROOF,
+    }
 }
 
 
@@ -149,7 +196,7 @@ def get_stats() -> dict[str, ModelUsageStats]:
 def print_stats() -> None:
     """Imprime relatório de uso e custo estimado."""
     print("\n" + "=" * 70)
-    print("RELATÓRIO DE USO DA API KIMI")
+    print("RELATÓRIO DE USO DA API OPENAI")
     print("=" * 70)
     total_cost = 0
     for model, stat in _stats.items():
@@ -178,57 +225,124 @@ def call_model(
     user_prompt: str,
     model: str,
     max_tokens: int = DEFAULT_MAX_TOKENS,
-    temperature: float = DEFAULT_TEMPERATURE,
     track_stats: bool = True,
+    stage: str = "indefinida",
 ) -> str:
     """
-    Chama a API Kimi com formato compatível OpenAI.
+    Chama a Chat Completions API com timeout por requisição e retries explícitos.
+
+    Faz retry apenas em falhas transitórias:
+    - timeout;
+    - conexão;
+    - rate limit;
+    - erro interno do servidor.
     """
     messages = [
         {"role": "system", "content": system_prompt},
         {"role": "user", "content": user_prompt},
     ]
-
     estimated_input_tokens = len(system_prompt + user_prompt) // 3
 
-    start_time = time.time()
-    try:
-        response = _client.chat.completions.create(
-            model=model,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            messages=messages,
-            response_format={"type": "json_object"},  # Força objeto JSON, não lista
+    retryable_errors = (
+        APITimeoutError,
+        APIConnectionError,
+        RateLimitError,
+        InternalServerError,
+    )
+
+    for attempt in range(1, API_MAX_RETRIES + 1):
+        start_time = time.time()
+        print(
+            f"  [API] etapa={stage} | modelo={model} | "
+            f"tentativa={attempt}/{API_MAX_RETRIES} | "
+            f"timeout={API_TIMEOUT_SECONDS:.0f}s | max_tokens={max_tokens}"
         )
 
-        result = response.choices[0].message.content
+        try:
+            response = _client.chat.completions.create(
+                model=model,
+                messages=messages,
+                max_completion_tokens=max_tokens,
+                response_format={"type": "json_object"},
+                timeout=API_TIMEOUT_SECONDS,
+            )
 
-        # Detecta se a resposta foi truncada (finish_reason)
-        finish_reason = response.choices[0].finish_reason
-        if finish_reason == "length":
-            print(f"  [AVISO] Resposta TRUNCADA por max_tokens! "
-                  f"JSON pode estar incompleto. ({len(result)} chars)")
+            result = response.choices[0].message.content
+            if not result or not result.strip():
+                raise ValueError(
+                    f"Resposta vazia na etapa {stage}, usando o modelo {model}."
+                )
 
-        if track_stats and model in _stats:
-            stat = _stats[model]
-            stat.calls += 1
-            stat.input_tokens += estimated_input_tokens
-            stat.output_tokens += len(result) // 3
-            stat.successes += 1
+            finish_reason = response.choices[0].finish_reason
+            if finish_reason == "length":
+                print(
+                    f"  [AVISO] etapa={stage}: resposta truncada por limite "
+                    f"de tokens; o JSON pode estar incompleto."
+                )
 
-        elapsed = time.time() - start_time
-        print(f"  [API] {model} | {elapsed:.1f}s | input ~{estimated_input_tokens} tokens | "
-              f"output ~{len(result)//3} tokens | finish={finish_reason}")
+            if track_stats and model in _stats:
+                stat = _stats[model]
+                stat.calls += 1
+                if response.usage:
+                    stat.input_tokens += response.usage.prompt_tokens
+                    stat.output_tokens += response.usage.completion_tokens
+                stat.successes += 1
 
-        return result
+            elapsed = time.time() - start_time
+            actual_input = (
+                response.usage.prompt_tokens
+                if response.usage
+                else estimated_input_tokens
+            )
+            actual_output = (
+                response.usage.completion_tokens
+                if response.usage
+                else len(result) // 3
+            )
+            print(
+                f"  [API] etapa={stage} | modelo={model} | OK em {elapsed:.1f}s | "
+                f"input={actual_input} | output={actual_output} | "
+                f"finish={finish_reason}"
+            )
+            return result
 
-    except Exception as e:
-        if track_stats and model in _stats:
-            _stats[model].failures += 1
+        except retryable_errors as exc:
+            elapsed = time.time() - start_time
+            if track_stats and model in _stats:
+                _stats[model].failures += 1
 
-        elapsed = time.time() - start_time
-        print(f"  [API] {model} | FALHA após {elapsed:.1f}s | {type(e).__name__}: {e}")
-        raise
+            if attempt >= API_MAX_RETRIES:
+                print(
+                    f"  [API] etapa={stage} | modelo={model} | "
+                    f"FALHA DEFINITIVA após {attempt} tentativas: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                raise
+
+            delay = min(
+                API_RETRY_MAX_SECONDS,
+                API_RETRY_BASE_SECONDS * (2 ** (attempt - 1)),
+            )
+            delay += random.uniform(0, min(2.0, delay * 0.2))
+            print(
+                f"  [API] etapa={stage} | erro transitório após {elapsed:.1f}s: "
+                f"{type(exc).__name__}: {exc}. "
+                f"Nova tentativa em {delay:.1f}s."
+            )
+            time.sleep(delay)
+
+        except Exception as exc:
+            if track_stats and model in _stats:
+                _stats[model].failures += 1
+            elapsed = time.time() - start_time
+            print(
+                f"  [API] etapa={stage} | modelo={model} | "
+                f"erro não transitório após {elapsed:.1f}s: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            raise
+
+    raise RuntimeError("Fluxo de retry terminou sem resposta nem exceção.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -288,7 +402,19 @@ Gere um novo código Python completo e executável.]
 Preencha o schema VerificationPlan: objects_and_representation, sympy_networkxFunctions,
 reduces_to_symbolic_identity, ambiguities_to_resolve, code, correspondence_table, verification_risks."""
 
-    raw = call_model(SYSTEM_MATH_RESEARCH, user + JSON_ONLY_SUFFIX, model=model)
+    token_limit = (
+        MAX_TOKENS_REPAIR
+        if is_repair
+        else MAX_TOKENS_VERIFICATION
+    )    
+
+    raw = call_model(
+    SYSTEM_MATH_RESEARCH,
+    user + JSON_ONLY_SUFFIX,
+    model=model,
+    max_tokens=token_limit,
+        stage="prompt_3_repair" if is_repair else "prompt_3_verification",
+    )
     return _parse(raw, VerificationPlan)
 
 
@@ -624,7 +750,13 @@ combinatório/aritmético próprio. Priorize os resultados principais do paper.
 IMPORTANTE: Retorne um objeto JSON com a chave EXATA "results" (não "theorems"), assim:
 {{"results": [{{"label": "Theorem 1.1", "statement": "...", "context": "...", "in_scope": true, "is_proved_in_paper": true}}]}}"""
 
-    raw = call_model(SYSTEM_EXTRACTOR, user + JSON_ONLY_SUFFIX, model=MODEL_EXTRACTION)
+    raw = call_model(
+    SYSTEM_EXTRACTOR,
+    user + JSON_ONLY_SUFFIX,
+    model=MODEL_EXTRACTION,
+    max_tokens=MAX_TOKENS_EXTRACTION,
+        stage="prompt_0_extraction",
+    )
     return _parse(raw, ExtractedResultsBatch)
 
 
@@ -648,7 +780,13 @@ IMPORTANTE: Siga EXATAMENTE estes tipos:
 
 Retorne um objeto JSON com TODOS estes campos."""
 
-    raw = call_model(SYSTEM_MATH_RESEARCH, user + JSON_ONLY_SUFFIX, model=MODEL_ANALYSIS)
+    raw = call_model(
+    SYSTEM_MATH_RESEARCH,
+    user + JSON_ONLY_SUFFIX,
+    model=MODEL_ANALYSIS,
+    max_tokens=MAX_TOKENS_ANALYSIS,
+        stage="prompt_1_analysis",
+    )
     return _parse(raw, ResultAnalysis)
 
 
@@ -669,7 +807,13 @@ IMPORTANTE: Siga EXATAMENTE estes tipos:
 
 Ao final, preencha `top_three` com os nomes dos três candidatos mais promissores, em ordem."""
 
-    raw = call_model(SYSTEM_MATH_RESEARCH, user + JSON_ONLY_SUFFIX, model=MODEL_CONJECTURES)
+    raw = call_model(
+    SYSTEM_MATH_RESEARCH,
+    user + JSON_ONLY_SUFFIX,
+    model=MODEL_CONJECTURES,
+    max_tokens=MAX_TOKENS_CONJECTURES,
+        stage="prompt_2_conjectures",
+    )
     return _parse(raw, ConjectureBatch)
 
 
@@ -686,14 +830,28 @@ Preencha o schema VerificationPlan: objects_and_representation, sympy_networkxFu
 reduces_to_symbolic_identity, ambiguities_to_resolve, code (código Python completo e
 executável, com print/assert de PASS/FAIL), correspondence_table, verification_risks."""
 
-    raw = call_model(SYSTEM_MATH_RESEARCH, user + JSON_ONLY_SUFFIX, model=actual_model)
+    raw = call_model(
+    SYSTEM_MATH_RESEARCH,
+    user + JSON_ONLY_SUFFIX,
+    model=actual_model,
+    max_tokens=MAX_TOKENS_VERIFICATION,
+        stage="prompt_3_verification",
+    )
     return _parse(raw, VerificationPlan)
 
 
 def run_prompt_6(working_code: str, mathematical_statement: str) -> ProofAttempt:
+    max_code_chars = int(os.environ.get("PROMPT_6_MAX_CODE_CHARS", "20000"))
+    bounded_code = working_code[:max_code_chars]
+    if len(working_code) > max_code_chars:
+        print(
+            f"  [PROMPT 6] Código truncado de {len(working_code)} para "
+            f"{max_code_chars} caracteres para reduzir latência."
+        )
+
     user = f"""O seguinte código tem uma verificação Sympy/networkx funcionando:
 
-{working_code}
+{bounded_code}
 
 O resultado informal correspondente é:
 {mathematical_statement}
@@ -703,5 +861,11 @@ base apenas em checagem finita. Preencha o schema ProofAttempt: reduced_to_symbo
 proof_status ("proved" | "bounded_evidence_only" | "neither"), informal_proof, final_code,
 techniques_used, unresolved_step."""
 
-    raw = call_model(SYSTEM_MATH_RESEARCH, user + JSON_ONLY_SUFFIX, model=MODEL_PROOF)
+    raw = call_model(
+    SYSTEM_PROVER,
+    user + JSON_ONLY_SUFFIX,
+    model=MODEL_PROOF,
+    max_tokens=MAX_TOKENS_PROOF,
+        stage="prompt_6_proof",
+    )
     return _parse(raw, ProofAttempt)
